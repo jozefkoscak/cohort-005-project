@@ -4,7 +4,13 @@ import { getCurrentUserId } from "~/lib/session";
 import { UserRole } from "~/db/schema";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
-import { AlertTriangle, ArrowLeft, Users, Award } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Users,
+  Award,
+  RotateCcw,
+} from "lucide-react";
 import { data, isRouteErrorResponse } from "react-router";
 import { db } from "~/db";
 import {
@@ -17,6 +23,9 @@ import {
   quizAttempts,
   lessonProgress,
   LessonProgressStatus,
+  purchases,
+  refunds,
+  RefundStatus,
 } from "~/db/schema";
 import { eq, and, or, sql, desc } from "drizzle-orm";
 
@@ -39,6 +48,61 @@ function getCourseEnrolledStudents(courseId: number) {
     .from(enrollments)
     .where(eq(enrollments.courseId, courseId))
     .all();
+}
+
+function getCourseRefundedLearners(courseId: number) {
+  return db
+    .select({
+      refundId: refunds.id,
+      name: users.name,
+      purchasedAt: purchases.createdAt,
+      requestedAt: refunds.requestedAt,
+      refundedAt: refunds.resolvedAt,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .where(
+      and(
+        eq(purchases.courseId, courseId),
+        eq(refunds.status, RefundStatus.Approved)
+      )
+    )
+    .orderBy(desc(refunds.resolvedAt))
+    .all();
+}
+
+function getCourseSuspendedLearnerIds(courseId: number): Set<number> {
+  const openRefundRequests = db
+    .select({ userId: purchases.userId })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .where(
+      and(
+        eq(purchases.courseId, courseId),
+        eq(refunds.status, RefundStatus.Open)
+      )
+    )
+    .all();
+
+  return new Set(openRefundRequests.map((r) => r.userId));
+}
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function daysBeforeBackingOut(purchasedAt: string, requestedAt: string) {
+  return Math.floor(
+    (new Date(requestedAt).getTime() - new Date(purchasedAt).getTime()) /
+      MS_PER_DAY
+  );
+}
+
+function formatRosterDate(iso: string) {
+  return new Date(iso).toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 }
 
 function getQuizByLessonId(lessonId: number) {
@@ -184,6 +248,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   // Get all enrolled students
   const enrolledStudents = getCourseEnrolledStudents(courseId);
+  const suspendedLearnerIds = getCourseSuspendedLearnerIds(courseId);
 
   // Get all lessons with quizzes for this course
   const courseModules = db
@@ -247,10 +312,29 @@ export async function loader({ params, request }: Route.LoaderArgs) {
       completedAt: enrollment.completedAt,
       progress,
       quizScores,
+      hasSuspendedAccess: suspendedLearnerIds.has(enrollment.userId),
     };
   });
 
-  return { course, students, quizCount: lessonQuizzes.length };
+  const refundedLearners = getCourseRefundedLearners(courseId).map(
+    (refund) => ({
+      refundId: refund.refundId,
+      name: refund.name,
+      purchasedAt: refund.purchasedAt,
+      refundedAt: refund.refundedAt,
+      daysBeforeBackingOut: daysBeforeBackingOut(
+        refund.purchasedAt,
+        refund.requestedAt
+      ),
+    })
+  );
+
+  return {
+    course,
+    students,
+    quizCount: lessonQuizzes.length,
+    refundedLearners,
+  };
 }
 
 function progressBar(progress: number) {
@@ -292,7 +376,7 @@ function quizScoreBadge(score: number | null, passed: boolean | null) {
 export default function InstructorStudentRoster({
   loaderData,
 }: Route.ComponentProps) {
-  const { course, students, quizCount } = loaderData;
+  const { course, students, quizCount, refundedLearners } = loaderData;
 
   return (
     <div className="mx-auto max-w-7xl p-6 lg:p-8">
@@ -390,8 +474,13 @@ export default function InstructorStudentRoster({
                       >
                         <td className="px-4 py-3">
                           <div>
-                            <p className="text-sm font-medium">
+                            <p className="flex items-center gap-2 text-sm font-medium">
                               {student.name}
+                              {student.hasSuspendedAccess && (
+                                <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-400">
+                                  Suspended Access
+                                </span>
+                              )}
                             </p>
                             <p className="text-xs text-muted-foreground">
                               {student.email}
@@ -442,6 +531,63 @@ export default function InstructorStudentRoster({
             </div>
           </CardContent>
         </Card>
+      )}
+
+      {refundedLearners.length > 0 && (
+        <section className="mt-10">
+          <h2 className="mb-4 flex items-center gap-2 text-xl font-semibold">
+            <RotateCcw className="size-5 text-muted-foreground" />
+            Refunded Learners
+          </h2>
+          <Card>
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border bg-muted/50">
+                      <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                        Learner
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                        Purchased
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                        Refunded
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                        Backed Out
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {refundedLearners.map((learner) => (
+                      <tr
+                        key={learner.refundId}
+                        className="border-b border-border last:border-0"
+                      >
+                        <td className="px-4 py-3 text-sm font-medium">
+                          {learner.name}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">
+                          {formatRosterDate(learner.purchasedAt)}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">
+                          {learner.refundedAt
+                            ? formatRosterDate(learner.refundedAt)
+                            : "—"}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">
+                          backed out after {learner.daysBeforeBackingOut}{" "}
+                          {learner.daysBeforeBackingOut === 1 ? "day" : "days"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        </section>
       )}
     </div>
   );
