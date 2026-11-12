@@ -17,8 +17,11 @@ import {
 import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
-
-const REFUND_WINDOW_DAYS = 14;
+import {
+  REFUND_WINDOW_DAYS,
+  calendarDay,
+  lastDayOfRefundWindow,
+} from "~/lib/refunds";
 const MAX_WATCHED_HOURS = 2;
 
 const refundParamsSchema = z.object({
@@ -68,20 +71,6 @@ function getOpenRefundRequest(purchaseId: number) {
       )
     )
     .get();
-}
-
-// The fourteen-day window is counted in whole days, not hours — someone who
-// buys at 23:00 should still get the whole of their fourteenth day.
-function calendarDay(when: Date): string {
-  const month = String(when.getMonth() + 1).padStart(2, "0");
-  const day = String(when.getDate()).padStart(2, "0");
-  return `${when.getFullYear()}-${month}-${day}`;
-}
-
-function lastDayOfWindow(purchasedAtIso: string): string {
-  const deadline = new Date(purchasedAtIso);
-  deadline.setDate(deadline.getDate() + REFUND_WINDOW_DAYS);
-  return calendarDay(deadline);
 }
 
 /**
@@ -161,7 +150,7 @@ export async function action({ params, request }: Route.ActionArgs) {
   }
 
   const today = calendarDay(new Date());
-  const withinRefundWindow = today <= lastDayOfWindow(purchase.createdAt);
+  const withinRefundWindow = today <= lastDayOfRefundWindow(purchase.createdAt);
 
   if (!withinRefundWindow) {
     throw data(`The ${REFUND_WINDOW_DAYS}-day window has closed.`, {
