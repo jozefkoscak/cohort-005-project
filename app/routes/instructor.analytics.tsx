@@ -22,6 +22,7 @@ import { db } from "~/db";
 import {
   CourseStatus,
   LessonProgressStatus,
+  RefundStatus,
   UserRole,
   comments,
   courseRatings,
@@ -34,9 +35,16 @@ import {
   purchases,
   quizAttempts,
   quizzes,
+  refunds,
   users,
 } from "~/db/schema";
 import { splitRevenue, type AnalyticsRange } from "~/lib/analytics";
+import {
+  earningsByBucket,
+  summarizeEarnings,
+  type PurchaseWithRefundRequests,
+} from "~/lib/earnings";
+import { REFUND_FEE_RATE, calendarDay } from "~/lib/refunds";
 import { getDiscountForCountry } from "~/lib/ppp";
 import {
   ANALYTICS_RANGES,
@@ -67,9 +75,9 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "~/components/ui/tabs";
 import { AlertTriangle, Rocket } from "lucide-react";
 
 // ─── Instructor Analytics ───
-// What an instructor earned, and when. Three money figures rather than one:
+// What an instructor earned, and when. Several money figures rather than one:
 // a lone number here gets read as "what I get paid", and the platform's 20%
-// cut makes that reading wrong.
+// cut and Refund Fees make that reading wrong.
 //
 // All page state — tab, range, instructor, course — lives in search params, so
 // a view can be linked to and reloaded. The loader reads them; the controls
@@ -82,9 +90,12 @@ import { AlertTriangle, Rocket } from "lucide-react";
 type AnalyticsTab = "overview" | "course";
 
 const chartConfig = {
-  grossCents: { label: "Gross revenue", color: "var(--chart-1)" },
+  grossCents: { label: "Earned revenue", color: "var(--chart-1)" },
   netCents: { label: "Net earnings", color: "var(--chart-2)" },
+  refundFeesCents: { label: "Refund fees", color: "var(--chart-3)" },
 } satisfies ChartConfig;
+
+const REFUND_FEE_PERCENT = REFUND_FEE_RATE * 100;
 
 export function meta() {
   return [
@@ -99,17 +110,11 @@ function parseId(value: string | null): number | null {
   return value !== null && Number.isInteger(id) && id > 0 ? id : null;
 }
 
-type RevenueSummary = {
-  grossCents: number;
-  feeCents: number;
-  netCents: number;
-  purchaseCount: number;
-};
-
 type RevenuePoint = {
   bucket: string;
   grossCents: number;
   netCents: number;
+  refundFeesCents: number;
 };
 
 type RevenueSeries = {
@@ -232,6 +237,70 @@ function ownedBy(instructorId: number | null) {
     : eq(courses.instructorId, instructorId);
 }
 
+function withoutApprovedRefundRequest() {
+  return notExists(
+    db
+      .select({ one: sql`1` })
+      .from(refunds)
+      .where(
+        and(
+          eq(refunds.purchaseId, purchases.id),
+          eq(refunds.status, RefundStatus.Approved)
+        )
+      )
+  );
+}
+
+function rangeStartDay(range: AnalyticsRange): string | null {
+  const start = rangeStart(range);
+  return start === null ? null : calendarDay(new Date(start));
+}
+
+// Every purchase regardless of range: one bought long ago can still become
+// Earned Revenue or draw a Refund Fee inside the range.
+function getPurchasesWithRefundRequests(
+  instructorId: number | null
+): PurchaseWithRefundRequests[] {
+  const purchaseRows = db
+    .select({
+      id: purchases.id,
+      amountPaid: purchases.amountPaid,
+      createdAt: purchases.createdAt,
+    })
+    .from(purchases)
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(ownedBy(instructorId))
+    .all();
+
+  const refundRequestRows = db
+    .select({
+      purchaseId: refunds.purchaseId,
+      status: refunds.status,
+      resolvedAt: refunds.resolvedAt,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(ownedBy(instructorId))
+    .all();
+
+  const refundRequestsByPurchase = new Map<
+    number,
+    PurchaseWithRefundRequests["refundRequests"]
+  >();
+  for (const { purchaseId, ...refundRequest } of refundRequestRows) {
+    const requests = refundRequestsByPurchase.get(purchaseId) ?? [];
+    requests.push(refundRequest);
+    refundRequestsByPurchase.set(purchaseId, requests);
+  }
+
+  return purchaseRows.map((purchase) => ({
+    amountPaid: purchase.amountPaid,
+    createdAt: purchase.createdAt,
+    refundRequests: refundRequestsByPurchase.get(purchase.id) ?? [],
+  }));
+}
+
 function getStudentRevenue(
   instructorId: number | null,
   range: AnalyticsRange
@@ -263,7 +332,8 @@ function getStudentRevenue(
       and(
         inArray(purchases.userId, studentIds),
         notExists(mintedSeats),
-        ownedBy(instructorId)
+        ownedBy(instructorId),
+        withoutApprovedRefundRequest()
       )
     )
     .groupBy(purchases.userId)
@@ -287,7 +357,11 @@ function getStudentRevenue(
     .innerJoin(courses, eq(purchases.courseId, courses.id))
     .innerJoin(seatCounts, eq(seatCounts.purchaseId, coupons.purchaseId))
     .where(
-      and(inArray(coupons.redeemedByUserId, studentIds), ownedBy(instructorId))
+      and(
+        inArray(coupons.redeemedByUserId, studentIds),
+        ownedBy(instructorId),
+        withoutApprovedRefundRequest()
+      )
     )
     .groupBy(coupons.redeemedByUserId)
     .all();
@@ -324,7 +398,9 @@ function getTopBuyers(
     .from(purchases)
     .innerJoin(courses, eq(purchases.courseId, courses.id))
     .innerJoin(users, eq(users.id, purchases.userId))
-    .where(purchaseScope(instructorId, range))
+    .where(
+      and(purchaseScope(instructorId, range), withoutApprovedRefundRequest())
+    )
     .groupBy(users.id)
     .orderBy(desc(sum(purchases.amountPaid)))
     .limit(TOP_BUYER_LIMIT)
@@ -349,7 +425,8 @@ function getTopBuyers(
     .where(
       and(
         inArray(purchases.userId, buyerIds),
-        purchaseScope(instructorId, range)
+        purchaseScope(instructorId, range),
+        withoutApprovedRefundRequest()
       )
     )
     .groupBy(purchases.userId)
@@ -430,44 +507,41 @@ function bucketRange(
   return buckets;
 }
 
-function getRevenueOverTime(
-  instructorId: number | null,
-  range: AnalyticsRange
+function getEarnedRevenueOverTime(
+  purchasesWithRefundRequests: PurchaseWithRefundRequests[],
+  range: AnalyticsRange,
+  today: string
 ): RevenueSeries {
   const granularity = range === "all" ? "month" : "day";
-  const bucketExpr = sql<string>`substr(${purchases.createdAt}, 1, ${
-    granularity === "day" ? 10 : 7
-  })`;
 
-  const rows = db
-    .select({ bucket: bucketExpr, gross: sum(purchases.amountPaid) })
-    .from(purchases)
-    .innerJoin(courses, eq(purchases.courseId, courses.id))
-    .where(purchaseScope(instructorId, range))
-    .groupBy(bucketExpr)
-    .orderBy(bucketExpr)
-    .all();
-
-  if (rows.length === 0 && range === "all") return { granularity, points: [] };
-
-  const grossByBucket = new Map(
-    rows.map((row) => [row.bucket, Number(row.gross ?? 0)])
+  const earnedByBucket = earningsByBucket(
+    purchasesWithRefundRequests,
+    today,
+    (day) => bucketOf(day, granularity)
   );
 
-  const now = new Date().toISOString();
+  const firstBucket = [...earnedByBucket.keys()].sort().at(0);
   // A fixed range always spans its whole window, even before the first sale;
   // all time can only start where the data does.
-  const start = rangeStart(range) ?? rows[0].bucket;
+  const start = rangeStartDay(range) ?? firstBucket;
+  if (start === undefined) return { granularity, points: [] };
 
   const points = bucketRange(
     bucketOf(start, granularity),
-    bucketOf(now, granularity),
+    bucketOf(today, granularity),
     granularity
   ).map((bucket) => {
+    const earned = earnedByBucket.get(bucket);
+    const refundFeesCents = earned?.refundFeesCents ?? 0;
     const { grossCents, netCents } = splitRevenue(
-      grossByBucket.get(bucket) ?? 0
+      earned?.earnedGrossCents ?? 0
     );
-    return { bucket, grossCents, netCents };
+    return {
+      bucket,
+      grossCents,
+      netCents: netCents - refundFeesCents,
+      refundFeesCents,
+    };
   });
 
   return { granularity, points };
@@ -743,7 +817,8 @@ function getCourseRevenueByCountry(
     .where(
       and(
         eq(purchases.courseId, courseId),
-        sinceRange(purchases.createdAt, range)
+        sinceRange(purchases.createdAt, range),
+        withoutApprovedRefundRequest()
       )
     )
     .groupBy(purchases.country)
@@ -885,22 +960,14 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     older: (questionRow?.total ?? 0) - questionsInRange,
   };
 
-  // Gross revenue, the platform's fee and the instructor's net for the range.
-  const summaryRow = db
-    .select({
-      gross: sum(purchases.amountPaid),
-      purchaseCount: count(purchases.id),
-    })
-    .from(purchases)
-    .innerJoin(courses, eq(purchases.courseId, courses.id))
-    .where(purchaseScope(instructorId, range))
-    .get();
-
-  // sum() returns null over an empty set, and a string when SQLite has rows.
-  const summary: RevenueSummary = {
-    ...splitRevenue(Number(summaryRow?.gross ?? 0)),
-    purchaseCount: summaryRow?.purchaseCount ?? 0,
-  };
+  const today = calendarDay(new Date());
+  const purchasesWithRefundRequests =
+    getPurchasesWithRefundRequests(instructorId);
+  const summary = summarizeEarnings(
+    purchasesWithRefundRequests,
+    rangeStartDay(range),
+    today
+  );
 
   // Revenue broken down by course, biggest earner first. Courses with no sales
   // in the range are absent rather than listed at zero.
@@ -913,7 +980,9 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     })
     .from(purchases)
     .innerJoin(courses, eq(purchases.courseId, courses.id))
-    .where(purchaseScope(instructorId, range))
+    .where(
+      and(purchaseScope(instructorId, range), withoutApprovedRefundRequest())
+    )
     .groupBy(courses.id)
     .all();
 
@@ -933,7 +1002,9 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     .select({ buyerCount: countDistinct(purchases.userId) })
     .from(purchases)
     .innerJoin(courses, eq(purchases.courseId, courses.id))
-    .where(purchaseScope(instructorId, range))
+    .where(
+      and(purchaseScope(instructorId, range), withoutApprovedRefundRequest())
+    )
     .get();
 
   const students = getStudentRevenue(instructorId, range);
@@ -993,7 +1064,7 @@ export async function loader({ request, url }: Route.LoaderArgs) {
     instructorId,
     selectedCourseId,
     summary,
-    series: getRevenueOverTime(instructorId, range),
+    series: getEarnedRevenueOverTime(purchasesWithRefundRequests, range, today),
     courses: courseRevenue,
     courseOptions,
     // Progress and drop-off carry no usable timestamp, so they span all time
@@ -1213,6 +1284,13 @@ function RevenueChart({ series }: { series: RevenueSeries }) {
           type="monotone"
           stroke="var(--color-netCents)"
           fill="var(--color-netCents)"
+          fillOpacity={0.2}
+        />
+        <Area
+          dataKey="refundFeesCents"
+          type="monotone"
+          stroke="var(--color-refundFeesCents)"
+          fill="var(--color-refundFeesCents)"
           fillOpacity={0.2}
         />
       </AreaChart>
@@ -1631,26 +1709,41 @@ export default function InstructorAnalytics({
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
-            <div className="grid gap-4 sm:grid-cols-3">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <MoneyCard
-                label="Gross revenue"
-                amountCents={summary.grossCents}
-                hint={`What students paid, across ${summary.purchaseCount} ${
-                  summary.purchaseCount === 1 ? "purchase" : "purchases"
-                }.`}
+                label="Earned revenue"
+                amountCents={summary.earnedGrossCents}
+                hint={`What students paid, across ${summary.earnedCount} ${
+                  summary.earnedCount === 1 ? "purchase" : "purchases"
+                } whose refund window closed in this period.`}
               />
               <MoneyCard
                 label={`Platform fee (${PLATFORM_FEE_PERCENT}%)`}
                 amountCents={summary.feeCents}
-                hint="Cadence's cut. Already deducted from your earnings."
+                hint="Cadence's cut of earned revenue. Nothing is taken on a refunded purchase."
+              />
+              <MoneyCard
+                label={`Refund fees (${REFUND_FEE_PERCENT}%)`}
+                amountCents={summary.refundFeesCents}
+                hint={`What you owe Cadence for ${summary.refundCount} ${
+                  summary.refundCount === 1 ? "refund" : "refunds"
+                } approved in this period.`}
               />
               <MoneyCard
                 label="Your net earnings"
                 amountCents={summary.netCents}
-                hint="What you keep — gross revenue minus the platform fee."
+                hint="Earned revenue minus the platform fee and refund fees. Can be negative."
                 emphasis
               />
             </div>
+
+            <MoneyCard
+              label="Held"
+              amountCents={summary.heldGrossCents}
+              hint={`What students paid for ${summary.heldCount} ${
+                summary.heldCount === 1 ? "purchase" : "purchases"
+              } still inside the refund window or with an open refund request, as of today. Not counted above until earned.`}
+            />
 
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <StatCard
@@ -1712,13 +1805,13 @@ export default function InstructorAnalytics({
                 <h2 className="mb-4 text-lg font-semibold">
                   Revenue over time
                 </h2>
-                {/* Keyed on the sales themselves, not on the points: a fixed
+                {/* Keyed on the payouts themselves, not on the points: a fixed
                     range always spans its whole window, so an instructor with
-                    no sales would otherwise get a flat line along zero rather
-                    than being told there is nothing there. */}
-                {summary.purchaseCount === 0 ? (
+                    nothing earned would otherwise get a flat line along zero
+                    rather than being told there is nothing there. */}
+                {summary.earnedCount + summary.refundCount === 0 ? (
                   <p className="py-12 text-center text-sm text-muted-foreground">
-                    No sales in this period yet.
+                    Nothing earned or refunded in this period yet.
                   </p>
                 ) : (
                   <RevenueChart series={series} />
@@ -1896,7 +1989,8 @@ export function HydrateFallback() {
         <Skeleton className="h-9 w-40" />
       </div>
       <Skeleton className="mb-4 h-9 w-64" />
-      <div className="mb-6 grid gap-4 sm:grid-cols-3">
+      <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Skeleton className="h-32 w-full" />
         <Skeleton className="h-32 w-full" />
         <Skeleton className="h-32 w-full" />
         <Skeleton className="h-32 w-full" />
