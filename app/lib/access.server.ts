@@ -7,6 +7,8 @@ import {
   courses,
   enrollments,
   purchases,
+  refunds,
+  RefundStatus,
 } from "~/db/schema";
 import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
@@ -42,6 +44,22 @@ function findPurchase(userId: number, courseId: number) {
     .get();
 }
 
+function hasOpenRefundRequest(userId: number, courseId: number) {
+  const openRefundRequest = db
+    .select({ id: refunds.id })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .where(
+      and(
+        eq(purchases.userId, userId),
+        eq(purchases.courseId, courseId),
+        eq(refunds.status, RefundStatus.Open)
+      )
+    )
+    .get();
+  return !!openRefundRequest;
+}
+
 // ─── Access Resolution ───
 // One place that answers "who is this, and what may they do with this course?".
 //
@@ -63,9 +81,12 @@ export type Access = {
   pppBlocked: boolean;
   pppBlockedCountry: string | null;
   pppPurchaseCountry: string | null;
+  /** Suspended Access: their Refund Request for this course is still open. */
+  refundSuspended: boolean;
   /**
    * May they read the course's content (lesson bodies, comments)?
-   * Staff always can. Students need an enrollment that isn't PPP-blocked.
+   * Staff always can. Students need an enrollment that isn't PPP-blocked or
+   * suspended.
    */
   canViewContent: boolean;
 };
@@ -80,6 +101,7 @@ const SIGNED_OUT: Access = {
   pppBlocked: false,
   pppBlockedCountry: null,
   pppPurchaseCountry: null,
+  refundSuspended: false,
   canViewContent: false,
 };
 
@@ -117,6 +139,9 @@ export async function getAccess(
     );
   }
 
+  const refundSuspended =
+    enrolled && !isStaff && hasOpenRefundRequest(userId, courseId);
+
   return {
     userId,
     user,
@@ -127,7 +152,8 @@ export async function getAccess(
     pppBlocked: ppp.blocked,
     pppBlockedCountry: ppp.blockedCountry,
     pppPurchaseCountry: ppp.purchaseCountry,
-    canViewContent: isStaff || (enrolled && !ppp.blocked),
+    refundSuspended,
+    canViewContent: isStaff || (enrolled && !ppp.blocked && !refundSuspended),
   };
 }
 
@@ -154,6 +180,13 @@ export async function requireContentAccess(
 
   if (!access.userId) {
     throw data("Select a user from the DevUI panel.", { status: 401 });
+  }
+
+  if (access.refundSuspended) {
+    throw data(
+      "Your access is suspended while we review your refund request.",
+      { status: 403 }
+    );
   }
 
   if (!access.canViewContent) {

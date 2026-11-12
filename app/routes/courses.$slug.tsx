@@ -381,7 +381,7 @@ function getPurchaseForCourse(userId: number, courseId: number) {
 
 function getOpenRefundRequest(purchaseId: number) {
   return db
-    .select({ id: refunds.id })
+    .select({ id: refunds.id, requestedAt: refunds.requestedAt })
     .from(refunds)
     .where(
       and(
@@ -518,12 +518,18 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   let lessonProgressMap: Record<number, string> = {};
   let nextLessonId: number | null = null;
   let refundOffer: { amount: number; lastDayInWindow: string } | null = null;
+  let suspendedSince: string | null = null;
 
   if (currentUserId) {
     enrolled = isUserEnrolled(currentUserId, course.id);
 
     if (enrolled) {
       refundOffer = getRefundOffer(currentUserId, { id: course.id });
+
+      const purchase = getPurchaseForCourse(currentUserId, course.id);
+      suspendedSince = purchase
+        ? (getOpenRefundRequest(purchase.id)?.requestedAt ?? null)
+        : null;
 
       progress = calculateProgress(currentUserId, course.id, false);
 
@@ -568,6 +574,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ratingSummary,
     userRating,
     refundOffer,
+    suspendedSince,
   };
 }
 
@@ -669,6 +676,7 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     ratingSummary,
     userRating,
     refundOffer,
+    suspendedSince,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -869,6 +877,8 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
                     Manage Course
                   </Button>
                 </Link>
+              ) : enrolled && suspendedSince ? (
+                <SuspendedAccessNotice requestedAt={suspendedSince} />
               ) : enrolled ? (
                 <>
                   <div className="mb-2 flex items-center justify-between text-sm">
@@ -981,6 +991,20 @@ function RateCourse({ userRating }: { userRating: number | null }) {
   );
 }
 
+function SuspendedAccessNotice({ requestedAt }: { requestedAt: string }) {
+  return (
+    <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950">
+      <p className="font-medium">Your access is suspended</p>
+      <p className="mt-1 text-muted-foreground">
+        We have been reviewing your refund request since{" "}
+        {new Date(requestedAt).toLocaleDateString()}. Your access to the course
+        is paused until we decide. If we decline it, you pick up where you left
+        off.
+      </p>
+    </div>
+  );
+}
+
 function RequestRefund({ slug, amount }: { slug: string; amount: number }) {
   const fetcher = useFetcher<{ errors?: Record<string, string> }>();
   const [isFormOpen, setIsFormOpen] = useState(false);
@@ -1014,6 +1038,11 @@ function RequestRefund({ slug, amount }: { slug: string; amount: number }) {
       <p className="mb-3 text-xs text-muted-foreground">
         We will send {formatPrice(amount)} back to the card you paid with, once
         someone has read your note.
+      </p>
+      <p className="mb-3 text-xs text-muted-foreground">
+        Your access is paused while we review it. If we approve it, you leave
+        the course for good: your progress, quiz results, rating and comments
+        in it are deleted.
       </p>
       <fetcher.Form
         method="post"

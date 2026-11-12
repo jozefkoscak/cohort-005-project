@@ -94,6 +94,8 @@ function buildRefundRequestEmail(input: {
       "",
       "Our team reviews every refund request by hand. You do not need to do anything else — we will email you again when it is done.",
       "",
+      "While we review it, your access to the course is paused. If we approve it, you leave the course for good: your progress, quiz results, rating and comments in it are deleted.",
+      "",
       "— The Cadence team",
     ].join("\n"),
   };

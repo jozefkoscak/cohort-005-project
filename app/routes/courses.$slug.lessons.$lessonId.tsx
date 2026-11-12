@@ -722,6 +722,14 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   }
 
   const access = await getAccess(request, course.id);
+
+  if (access.refundSuspended) {
+    throw data(
+      "Your access to this course is suspended while we review your refund request.",
+      { status: 403 }
+    );
+  }
+
   const currentUserId = access.userId;
   const enrolled = access.enrolled;
   let lessonStatus: string | null = null;
